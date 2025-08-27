@@ -1,0 +1,7 @@
+build
+
+vendor/
+vendor/!modules.txt
+
+*.mod
+*.sum
