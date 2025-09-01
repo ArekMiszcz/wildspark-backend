@@ -417,7 +417,10 @@ func (dm *DatabaseManager) RestoreWorldFromPersistence(ctx context.Context, game
 
 		// Append dynamic objects to existing map objects
 		if len(dynamicObjects) > 0 {
-			gameState.gameObjects = append(gameState.gameObjects, dynamicObjects...)
+			// Use AddStaticCollider for dynamic objects restored from persistence, or consider owner assignment later.
+			for _, obj := range dynamicObjects {
+				gameState.AddStaticCollider(obj, nil)
+			}
 			dm.logger.Info("Added %d dynamic objects from persistent storage", len(dynamicObjects))
 		}
 
@@ -437,7 +440,9 @@ func (dm *DatabaseManager) RestoreWorldFromPersistence(ctx context.Context, game
 
 			// Append dynamic objects to existing map objects
 			if len(dynamicObjects) > 0 {
-				gameState.gameObjects = append(gameState.gameObjects, dynamicObjects...)
+				for _, obj := range dynamicObjects {
+					gameState.AddStaticCollider(obj, nil)
+				}
 				dm.logger.Info("Added %d dynamic objects from individual storage", len(dynamicObjects))
 			}
 		}

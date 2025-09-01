@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/heroiclabs/nakama-common/runtime"
-	"github.com/rudransh61/Physix-go/pkg/polygon"
 	"github.com/rudransh61/Physix-go/pkg/rigidbody"
 	"github.com/rudransh61/Physix-go/pkg/vector"
 )
@@ -136,12 +135,21 @@ type LoadedMap struct {
 	Height         int
 	TileWidth      int
 	TileHeight     int
+	Objects        map[int]*ObjectData
 	GameObjects    []*rigidbody.RigidBody
 	SpawnPoints    []vector.Vector
 	Colliders      []*rigidbody.RigidBody
 	Background     string
 	Properties     map[string]interface{}
 	TileCollisions map[int]TileCollisionTemplate // Map of tile ID to collision data
+	// per-object colliders for scripted tile objects (owner => list of colliders)
+	ObjectColliders map[int][]OwnedCollider
+}
+
+// OwnedCollider stores a rigidbody plus optional polygon points for physics registration
+type OwnedCollider struct {
+	RB     *rigidbody.RigidBody
+	Points []vector.Vector
 }
 
 // ---- Public API ----
@@ -216,6 +224,7 @@ func (ml *MapLoader) LoadMap(filename string) (*LoadedMap, error) {
 		Height:         tiledMap.Height,
 		TileWidth:      tiledMap.TileWidth,
 		TileHeight:     tiledMap.TileHeight,
+		Objects:        make(map[int]*ObjectData),
 		GameObjects:    make([]*rigidbody.RigidBody, 0),
 		SpawnPoints:    make([]vector.Vector, 0),
 		Colliders:      make([]*rigidbody.RigidBody, 0),
@@ -264,10 +273,42 @@ func (ml *MapLoader) LoadMap(filename string) (*LoadedMap, error) {
 func (ml *MapLoader) ApplyMapToGameState(loadedMap *LoadedMap, gameState *GameMatchState) {
 	ml.logger.Info("Applying map to game state")
 
-	// clear and add
+	// Clear existing objects and reinitialize from map
+	// We'll replace the game objects slice under mutex to be safe
+	gameState.mu.Lock()
+	// reset gameObjects but keep maps initialized
 	gameState.gameObjects = make([]*rigidbody.RigidBody, 0, len(loadedMap.GameObjects)+len(loadedMap.Colliders))
-	gameState.gameObjects = append(gameState.gameObjects, loadedMap.GameObjects...)
-	gameState.gameObjects = append(gameState.gameObjects, loadedMap.Colliders...)
+	gameState.mu.Unlock()
+
+	// Add all static game objects from loaded map (static colliders and polygons)
+	for _, rb := range loadedMap.GameObjects {
+		// GameObjects from map are static by default; register as static colliders
+		gameState.AddStaticCollider(rb, nil)
+	}
+
+	for _, rb := range loadedMap.Colliders {
+		// Some colliders may be polygons with physics registration already done in loader.
+		// We don't have polygon points here, so call AddStaticCollider which will not register polygon if points nil.
+		gameState.AddStaticCollider(rb, nil)
+	}
+
+	// clear and set scripted objects
+	gameState.mu.Lock()
+	gameState.objects = make(map[int]*ObjectData)
+	for k, v := range loadedMap.Objects {
+		gameState.objects[k] = v
+	}
+	gameState.mu.Unlock()
+
+	// Register colliders that were created for scripted tile objects as owner colliders so scripts can remove/replace them
+	if len(loadedMap.ObjectColliders) > 0 {
+		for ownerID, collList := range loadedMap.ObjectColliders {
+			for _, oc := range collList {
+				// AddOwnerCollider handles registering polygon points with the physics engine and ownership bookkeeping
+				gameState.AddOwnerCollider(ownerID, oc.RB, oc.Points)
+			}
+		}
+	}
 
 	// set world bounds
 	if gameState.physicsEngine != nil {
@@ -280,8 +321,9 @@ func (ml *MapLoader) ApplyMapToGameState(loadedMap *LoadedMap, gameState *GameMa
 		gameState.physicsEngine.SetWorldBounds(worldBounds)
 	}
 
-	ml.logger.Info("Map applied. Total objects: %d, world size: %dx%d px",
+	ml.logger.Info("Map applied. Total objects: %d, scripted objects: %d, world size: %dx%d px",
 		len(gameState.gameObjects),
+		len(gameState.objects),
 		loadedMap.Width*loadedMap.TileWidth,
 		loadedMap.Height*loadedMap.TileHeight)
 }
@@ -362,15 +404,7 @@ func (ml *MapLoader) processTileLayer(tmap *TiledMap, layer *TiledLayer, lm *Loa
 			cx := float64(x0)*tw + (segmentW*tw)/2.0
 			cy := float64(y)*th + th/2.0
 
-			collider := &rigidbody.RigidBody{
-				Position:  vector.Vector{X: cx, Y: cy},
-				Velocity:  vector.Vector{X: 0, Y: 0},
-				Mass:      0, // static
-				Shape:     "rectangle",
-				Width:     segmentW * tw,
-				Height:    th,
-				IsMovable: false,
-			}
+			collider := MakeRectangleRigidBody(cx, cy, segmentW*tw, th)
 			lm.Colliders = append(lm.Colliders, collider)
 		}
 	}
@@ -414,94 +448,25 @@ func (ml *MapLoader) processTileLayerCollisions(tmap *TiledMap, layer *TiledLaye
 
 		// Process each collision template for this tile
 		for i, colliderTemplate := range tileTemplate.Colliders {
-			switch colliderTemplate.Type {
-			case "rectangle":
-				// Rectangle collider
-				// Calculate center position
-				centerX := tileX + colliderTemplate.OffsetX + colliderTemplate.Width/2
-				centerY := tileY + colliderTemplate.OffsetY + colliderTemplate.Height/2
+			// Use centralized helper to build the rigidbody (and optional points for polygons)
+			rb, points := MakeRigidBodyFromTileTemplate(tileX, tileY, colliderTemplate)
+			if rb == nil {
+				continue
+			}
 
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: centerX, Y: centerY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "rectangle",
-					Width:     colliderTemplate.Width,
-					Height:    colliderTemplate.Height,
-					IsMovable: false,
-				}
-
-				ml.logger.Debug("Added tile collision rectangle: gid=%d, idx=%d, pos=(%.2f,%.2f), size=(%.2fx%.2f)",
-					realGID, i, c.Position.X, c.Position.Y, c.Width, c.Height)
-				lm.Colliders = append(lm.Colliders, c)
-
+			switch strings.ToLower(rb.Shape) {
 			case "polygon":
-				// Polygon collider - translate all points relative to the tile position
-				points := make([]vector.Vector, len(colliderTemplate.Polygon))
-
-				minX, minY := float64(1e10), float64(1e10)
-				maxX, maxY := float64(-1e10), float64(-1e10)
-
-				for j, p := range colliderTemplate.Polygon {
-					// Add the polygon point coordinates to the tile position and template offset
-					vertexX := tileX + colliderTemplate.OffsetX + p.X
-					vertexY := tileY + colliderTemplate.OffsetY + p.Y
-					points[j] = vector.Vector{X: vertexX, Y: vertexY}
-
-					if vertexX < minX {
-						minX = vertexX
-					}
-					if vertexX > maxX {
-						maxX = vertexX
-					}
-					if vertexY < minY {
-						minY = vertexY
-					}
-					if vertexY > maxY {
-						maxY = vertexY
-					}
+				ml.logger.Info("Added tile collision polygon: gid=%d, idx=%d, pos=(%.2f,%.2f), vertices=%d",
+					realGID, i, rb.Position.X, rb.Position.Y, len(points))
+				if ml.physicsEngine != nil && len(points) > 0 {
+					AddPolygonToPhysicsEngine(ml.physicsEngine, rb, points)
 				}
-
-				width := maxX - minX
-				height := maxY - minY
-				centerX := minX + width/2
-				centerY := minY + height/2
-
-				poly := polygon.NewPolygon(points, 0, false)
-
-				poly.RigidBody.Position = vector.Vector{X: centerX, Y: centerY}
-				poly.RigidBody.Width = width
-				poly.RigidBody.Height = height
-				poly.RigidBody.IsMovable = false
-				poly.RigidBody.Shape = "polygon"
-
-				ml.logger.Debug("Added tile collision polygon: gid=%d, idx=%d, pos=(%.2f,%.2f), vertices=%d",
-					realGID, i, poly.RigidBody.Position.X, poly.RigidBody.Position.Y, len(points))
-
-				if ml.physicsEngine != nil {
-					AddPolygonToPhysicsEngine(ml.physicsEngine, &poly.RigidBody, points)
-				}
-
-				lm.Colliders = append(lm.Colliders, &poly.RigidBody)
-
-			case "circle":
-				// Circle collider - position at center
-				centerX := tileX + colliderTemplate.OffsetX
-				centerY := tileY + colliderTemplate.OffsetY
-
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: centerX, Y: centerY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "circle",
-					Radius:    colliderTemplate.Radius,
-					IsMovable: false,
-				}
-
-				ml.logger.Debug("Added tile collision circle: gid=%d, idx=%d, pos=(%.2f,%.2f), radius=%.2f",
-					realGID, i, c.Position.X, c.Position.Y, c.Radius)
-
-				lm.Colliders = append(lm.Colliders, c)
+				lm.Colliders = append(lm.Colliders, rb)
+			default:
+				// rectangle or circle
+				ml.logger.Info("Added tile collision %s: gid=%d, idx=%d, pos=(%.2f,%.2f), size=(%.2fx%.2f)",
+					strings.ToLower(rb.Shape), realGID, i, rb.Position.X, rb.Position.Y, rb.Width, rb.Height)
+				lm.Colliders = append(lm.Colliders, rb)
 			}
 		}
 	}
@@ -565,17 +530,9 @@ func (ml *MapLoader) processSingleTileCollision(tmap *TiledMap, layer *TiledLaye
 			centerX := tileX + obj.X + obj.Width/2
 			centerY := tileY + obj.Y + obj.Height/2
 
-			c := &rigidbody.RigidBody{
-				Position:  vector.Vector{X: centerX, Y: centerY},
-				Velocity:  vector.Vector{X: 0, Y: 0},
-				Mass:      0,
-				Shape:     "rectangle",
-				Width:     obj.Width,
-				Height:    obj.Height,
-				IsMovable: false,
-			}
+			c := MakeRectangleRigidBody(centerX, centerY, obj.Width, obj.Height)
 
-			ml.logger.Debug("Added tile collision rectangle: gid=%d, id=%d, pos=(%.2f,%.2f), size=(%.2fx%.2f)",
+			ml.logger.Info("Added tile collision rectangle: gid=%d, id=%d, pos=(%.2f,%.2f), size=(%.2fx%.2f)",
 				realGID, obj.ID, c.Position.X, c.Position.Y, c.Width, c.Height)
 			lm.Colliders = append(lm.Colliders, c)
 
@@ -606,27 +563,20 @@ func (ml *MapLoader) processSingleTileCollision(tmap *TiledMap, layer *TiledLaye
 				}
 			}
 
-			width := maxX - minX
-			height := maxY - minY
-			centerX := minX + width/2
-			centerY := minY + height/2
-
-			poly := polygon.NewPolygon(points, 0, false)
-
-			poly.RigidBody.Position = vector.Vector{X: centerX, Y: centerY}
-			poly.RigidBody.Width = width
-			poly.RigidBody.Height = height
-			poly.RigidBody.IsMovable = false
-			poly.RigidBody.Shape = "polygon"
-
-			ml.logger.Debug("Added tile collision polygon: gid=%d, id=%d, pos=(%.2f,%.2f), vertices=%d",
-				realGID, obj.ID, poly.RigidBody.Position.X, poly.RigidBody.Position.Y, len(points))
-
-			if ml.physicsEngine != nil {
-				AddPolygonToPhysicsEngine(ml.physicsEngine, &poly.RigidBody, points)
+			// Use helper to create polygon rigidbody from absolute points
+			rb, pts := MakePolygonRigidBodyFromPoints(points)
+			if rb != nil {
+				width := maxX - minX
+				height := maxY - minY
+				rb.Width = width
+				rb.Height = height
+				ml.logger.Info("Added tile collision polygon: gid=%d, id=%d, pos=(%.2f,%.2f), vertices=%d",
+					realGID, obj.ID, rb.Position.X, rb.Position.Y, len(points))
+				if ml.physicsEngine != nil && len(pts) > 0 {
+					AddPolygonToPhysicsEngine(ml.physicsEngine, rb, pts)
+				}
+				lm.Colliders = append(lm.Colliders, rb)
 			}
-
-			lm.Colliders = append(lm.Colliders, &poly.RigidBody)
 
 		} else if obj.Ellipse && obj.Width > 0 && obj.Height > 0 {
 			// Ellipse collider
@@ -638,16 +588,9 @@ func (ml *MapLoader) processSingleTileCollision(tmap *TiledMap, layer *TiledLaye
 			centerY := tileY + obj.Y + radiusY
 
 			avgRadius := (radiusX + radiusY) / 2.0
-			c := &rigidbody.RigidBody{
-				Position:  vector.Vector{X: centerX, Y: centerY},
-				Velocity:  vector.Vector{X: 0, Y: 0},
-				Mass:      0,
-				Shape:     "circle",
-				Radius:    avgRadius,
-				IsMovable: false,
-			}
+			c := MakeCircleRigidBody(centerX, centerY, avgRadius)
 
-			ml.logger.Debug("Added tile collision circle: gid=%d, id=%d, pos=(%.2f,%.2f), radius=%.2f",
+			ml.logger.Info("Added tile collision circle: gid=%d, id=%d, pos=(%.2f,%.2f), radius=%.2f",
 				realGID, obj.ID, c.Position.X, c.Position.Y, c.Radius)
 
 			lm.Colliders = append(lm.Colliders, c)
@@ -662,6 +605,7 @@ func (ml *MapLoader) processObjectLayer(tmap *TiledMap, layer *TiledLayer, lm *L
 
 	for i := range layer.Objects {
 		obj := &layer.Objects[i]
+
 		if !obj.Visible {
 			continue
 		}
@@ -676,15 +620,7 @@ func (ml *MapLoader) processObjectLayer(tmap *TiledMap, layer *TiledLayer, lm *L
 
 		if isCollision || strings.EqualFold(obj.Type, "collider") {
 			if obj.Width > 0 && obj.Height > 0 {
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: worldX, Y: worldY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "rectangle",
-					Width:     obj.Width,
-					Height:    obj.Height,
-					IsMovable: false,
-				}
+				c := MakeRectangleRigidBody(worldX, worldY, obj.Width, obj.Height)
 				ml.logger.Debug("Added rectangle collider: %s (id=%d) pos=(%.2f,%.2f) size=(%.2fx%.2f)",
 					obj.Name, obj.ID, c.Position.X, c.Position.Y, c.Width, c.Height)
 				lm.Colliders = append(lm.Colliders, c)
@@ -713,42 +649,25 @@ func (ml *MapLoader) processObjectLayer(tmap *TiledMap, layer *TiledLayer, lm *L
 					}
 				}
 
-				width := maxX - minX
-				height := maxY - minY
-				centerX := minX + width/2
-				centerY := minY + height/2
-
-				poly := polygon.NewPolygon(points, 0, false)
-
-				poly.RigidBody.Position = vector.Vector{X: centerX, Y: centerY}
-				poly.RigidBody.Width = width
-				poly.RigidBody.Height = height
-				poly.RigidBody.IsMovable = false
-				poly.RigidBody.Shape = "polygon"
-
-				ml.logger.Debug("Added polygon collider: %s (id=%d) pos=(%.2f,%.2f) vertices=%d",
-					obj.Name, obj.ID, poly.RigidBody.Position.X, poly.RigidBody.Position.Y, len(points))
-
-				if ml.physicsEngine != nil {
-					AddPolygonToPhysicsEngine(ml.physicsEngine, &poly.RigidBody, points)
+				rb, pts := MakePolygonRigidBodyFromPoints(points)
+				if rb != nil {
+					rb.Width = maxX - minX
+					rb.Height = maxY - minY
+					ml.logger.Info("Added polygon collider: %s (id=%d) pos=(%.2f,%.2f) vertices=%d",
+						obj.Name, obj.ID, rb.Position.X, rb.Position.Y, len(points))
+					if ml.physicsEngine != nil && len(pts) > 0 {
+						AddPolygonToPhysicsEngine(ml.physicsEngine, rb, pts)
+					}
+					lm.Colliders = append(lm.Colliders, rb)
 				}
-
-				lm.Colliders = append(lm.Colliders, &poly.RigidBody)
 			} else if obj.Ellipse && obj.Width > 0 && obj.Height > 0 {
 				radiusX := obj.Width / 2.0
 				radiusY := obj.Height / 2.0
 
 				avgRadius := (radiusX + radiusY) / 2.0
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: worldX, Y: worldY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "circle",
-					Radius:    avgRadius,
-					IsMovable: false,
-				}
+				c := MakeCircleRigidBody(worldX, worldY, avgRadius)
 
-				ml.logger.Debug("Added ellipse collider: %s (id=%d) pos=(%.2f,%.2f) radius=%.2f",
+				ml.logger.Info("Added ellipse collider: %s (id=%d) pos=(%.2f,%.2f) radius=%.2f",
 					obj.Name, obj.ID, c.Position.X, c.Position.Y, c.Radius)
 
 				lm.Colliders = append(lm.Colliders, c)
@@ -782,11 +701,19 @@ func (ml *MapLoader) processObjectLayerTileCollisions(tmap *TiledMap, layer *Til
 		// Get the real GID (removing flip bits)
 		realGID := sanitizeGID(obj.GID)
 
-		// Check if this tile has collision templates
-		tileTemplate, hasCollision := lm.TileCollisions[int(realGID)]
-		if !hasCollision {
-			// No collision data for this tile
-			continue
+		// If this object has a "Script" property, register it as a game object
+		if len(obj.Properties) > 0 && ml.hasStringProperty(obj.Properties, "Script", true) {
+			lm.Objects[obj.ID] = &ObjectData{
+				ID:    obj.ID,
+				Name:  obj.Name,
+				Type:  obj.Type,
+				GID:   realGID,
+				Props: map[string]interface{}{},
+			}
+
+			for _, p := range obj.Properties {
+				lm.Objects[obj.ID].Props[strings.ToLower(p.Name)] = p.Value
+			}
 		}
 
 		// Calculate world position for this tile object
@@ -795,99 +722,45 @@ func (ml *MapLoader) processObjectLayerTileCollisions(tmap *TiledMap, layer *Til
 		tileX := obj.X
 		tileY := obj.Y - float64(tmap.TileHeight) // Adjust for Tiled's coordinate system
 
-		ml.logger.Debug("Found tile object with collision template: gid=%d, pos=(%.2f,%.2f)",
+		// If we previously registered this as a scripted object, store its world center in Props for scripts/server use
+		if od, ok := lm.Objects[obj.ID]; ok {
+			od.Props["x"] = tileX + float64(tmap.TileWidth)/2.0
+			od.Props["y"] = tileY + float64(tmap.TileHeight)/2.0
+		}
+
+		ml.logger.Info("Found tile object with collision template: gid=%d, pos=(%.2f,%.2f)",
 			realGID, tileX, tileY)
+
+		// Check if this tile has collision templates
+		tileTemplate, hasCollision := lm.TileCollisions[int(realGID)]
+		if !hasCollision {
+			// No collision data for this tile
+			continue
+		}
+
+		// Ensure object-collider map initialized
+		if lm.ObjectColliders == nil {
+			lm.ObjectColliders = make(map[int][]OwnedCollider)
+		}
 
 		// Process each collision template for this tile
 		for i, colliderTemplate := range tileTemplate.Colliders {
-			switch colliderTemplate.Type {
-			case "rectangle":
-				// Rectangle collider
-				// Calculate center position
-				centerX := tileX + colliderTemplate.OffsetX + colliderTemplate.Width/2
-				centerY := tileY + colliderTemplate.OffsetX + colliderTemplate.Height/2
+			// Use centralized helper to build per-template collider
+			rb, points := MakeRigidBodyFromTileTemplate(tileX, tileY, colliderTemplate)
+			if rb == nil {
+				continue
+			}
 
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: centerX, Y: centerY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "rectangle",
-					Width:     colliderTemplate.Width,
-					Height:    colliderTemplate.Height,
-					IsMovable: false,
+			ml.logger.Info("Added tile object collision %s: gid=%d (idx=%d) pos=(%.2f,%.2f)", strings.ToLower(rb.Shape), realGID, i, rb.Position.X, rb.Position.Y)
+
+			// If this object is scripted, store as owner collider; otherwise add as static collider
+			if _, scripted := lm.Objects[obj.ID]; scripted {
+				lm.ObjectColliders[obj.ID] = append(lm.ObjectColliders[obj.ID], OwnedCollider{RB: rb, Points: points})
+			} else {
+				if ml.physicsEngine != nil && len(points) > 0 {
+					AddPolygonToPhysicsEngine(ml.physicsEngine, rb, points)
 				}
-
-				ml.logger.Debug("Added tile object collision rectangle: gid=%d, idx=%d, pos=(%.2f,%.2f), size=(%.2fx%.2f)",
-					realGID, i, c.Position.X, c.Position.Y, c.Width, c.Height)
-				lm.Colliders = append(lm.Colliders, c)
-
-			case "polygon":
-				// Polygon collider - translate all points relative to the tile position
-				points := make([]vector.Vector, len(colliderTemplate.Polygon))
-
-				minX, minY := float64(1e10), float64(1e10)
-				maxX, maxY := float64(-1e10), float64(-1e10)
-
-				for j, p := range colliderTemplate.Polygon {
-					// Add the polygon point coordinates to the tile position and template offset
-					vertexX := tileX + colliderTemplate.OffsetX + p.X
-					vertexY := tileY + colliderTemplate.OffsetX + p.Y
-					points[j] = vector.Vector{X: vertexX, Y: vertexY}
-
-					if vertexX < minX {
-						minX = vertexX
-					}
-					if vertexX > maxX {
-						maxX = vertexX
-					}
-					if vertexY < minY {
-						minY = vertexY
-					}
-					if vertexY > maxY {
-						maxY = vertexY
-					}
-				}
-
-				width := maxX - minX
-				height := maxY - minY
-				centerX := minX + width/2
-				centerY := minY + height/2
-
-				poly := polygon.NewPolygon(points, 0, false)
-
-				poly.RigidBody.Position = vector.Vector{X: centerX, Y: centerY}
-				poly.RigidBody.Width = width
-				poly.RigidBody.Height = height
-				poly.RigidBody.IsMovable = false
-				poly.RigidBody.Shape = "polygon"
-
-				ml.logger.Debug("Added tile object collision polygon: gid=%d, idx=%d, pos=(%.2f,%.2f), size=(%.2f,%.2f), vertices=%d",
-					realGID, i, poly.RigidBody.Position.X, poly.RigidBody.Position.Y, poly.RigidBody.Width, poly.RigidBody.Height, len(points))
-
-				if ml.physicsEngine != nil {
-					AddPolygonToPhysicsEngine(ml.physicsEngine, &poly.RigidBody, points)
-				}
-
-				lm.Colliders = append(lm.Colliders, &poly.RigidBody)
-
-			case "circle":
-				// Circle collider - position at center
-				centerX := tileX + colliderTemplate.OffsetX
-				centerY := tileY - colliderTemplate.Radius*2
-
-				c := &rigidbody.RigidBody{
-					Position:  vector.Vector{X: centerX, Y: centerY},
-					Velocity:  vector.Vector{X: 0, Y: 0},
-					Mass:      0,
-					Shape:     "circle",
-					Radius:    colliderTemplate.Radius,
-					IsMovable: false,
-				}
-
-				ml.logger.Debug("Added tile object collision circle: gid=%d, idx=%d, pos=(%.2f,%.2f), radius=%.2f",
-					realGID, i, c.Position.X, c.Position.Y, c.Radius)
-
-				lm.Colliders = append(lm.Colliders, c)
+				lm.Colliders = append(lm.Colliders, rb)
 			}
 		}
 	}
@@ -910,6 +783,17 @@ func (ml *MapLoader) isCollisionLayer(layer *TiledLayer) bool {
 		}
 	}
 
+	return false
+}
+
+func (ml *MapLoader) hasStringProperty(props []TiledProperty, name string, caseInsensitive bool) bool {
+	for _, p := range props {
+		if (caseInsensitive && strings.EqualFold(p.Name, name)) || (!caseInsensitive && p.Name == name) {
+			if _, ok := p.Value.(string); ok {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -967,7 +851,7 @@ func (ml *MapLoader) processTilesetColliders(tilesetData map[int]*TiledTilesetDa
 
 			// Calculate global tile ID
 			tileID := firstGID + tile.ID
-			ml.logger.Debug("Processing tile %d with objectgroup (%d objects)", tileID, len(tile.ObjectGroup.Objects))
+			ml.logger.Info("Processing tile %d with objectgroup (%d objects)", tileID, len(tile.ObjectGroup.Objects))
 
 			// Create a new tile collision template
 			tileTemplate := TileCollisionTemplate{
@@ -993,7 +877,7 @@ func (ml *MapLoader) processTilesetColliders(tilesetData map[int]*TiledTilesetDa
 					}
 					tileTemplate.Colliders = append(tileTemplate.Colliders, collider)
 
-					ml.logger.Debug("Added rectangle collider template for tile %d: pos=(%.2f,%.2f) size=(%.2fx%.2f)",
+					ml.logger.Info("Added rectangle collider template for tile %d: pos=(%.2f,%.2f) size=(%.2fx%.2f)",
 						tileID, obj.X, obj.Y, obj.Width, obj.Height)
 
 				} else if len(obj.Polygon) > 2 {
@@ -1013,7 +897,7 @@ func (ml *MapLoader) processTilesetColliders(tilesetData map[int]*TiledTilesetDa
 					}
 					tileTemplate.Colliders = append(tileTemplate.Colliders, collider)
 
-					ml.logger.Debug("Added polygon collider template for tile %d: offset=(%.2f,%.2f) vertices=%d",
+					ml.logger.Info("Added polygon collider template for tile %d: offset=(%.2f,%.2f) vertices=%d",
 						tileID, obj.X, obj.Y, len(points))
 
 				} else if obj.Ellipse && obj.Width > 0 && obj.Height > 0 {
@@ -1030,7 +914,7 @@ func (ml *MapLoader) processTilesetColliders(tilesetData map[int]*TiledTilesetDa
 					}
 					tileTemplate.Colliders = append(tileTemplate.Colliders, collider)
 
-					ml.logger.Debug("Added circle collider template for tile %d: center=(%.2f,%.2f) radius=%.2f",
+					ml.logger.Info("Added circle collider template for tile %d: center=(%.2f,%.2f) radius=%.2f",
 						tileID, obj.X+radiusX, obj.Y+radiusY, avgRadius)
 				} else {
 					ml.logger.Warn("Skipping unsupported tileset collider object (no size): tile=%d id=%d",
@@ -1041,12 +925,12 @@ func (ml *MapLoader) processTilesetColliders(tilesetData map[int]*TiledTilesetDa
 			// Add the collision template to the map if it has any colliders
 			if len(tileTemplate.Colliders) > 0 {
 				lm.TileCollisions[tileID] = tileTemplate
-				ml.logger.Debug("Created collision template for tile %d with %d colliders",
+				ml.logger.Info("Created collision template for tile %d with %d colliders",
 					tileID, len(tileTemplate.Colliders))
 			}
 		}
 	}
 
-	ml.logger.Debug("Finished processing tileset colliders, created %d tile collision templates",
+	ml.logger.Info("Finished processing tileset colliders, created %d tile collision templates",
 		len(lm.TileCollisions))
 }

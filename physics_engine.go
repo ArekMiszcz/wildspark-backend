@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/heroiclabs/nakama-common/runtime"
+	"github.com/rudransh61/Physix-go/pkg/polygon"
 	"github.com/rudransh61/Physix-go/pkg/rigidbody"
 	"github.com/rudransh61/Physix-go/pkg/vector"
 )
@@ -631,5 +632,94 @@ func (pe *PhysicsEngine) DumpPolygonRegistry(logger runtime.Logger) {
 		logger.Debug("[%d] Polygon at (%.2f, %.2f) - %d vertices",
 			count, rb.Position.X, rb.Position.Y, len(vertices))
 		count++
+	}
+}
+
+// MakeRectangleRigidBody creates a rectangle rigidbody centered at (cx,cy)
+func MakeRectangleRigidBody(cx, cy, width, height float64) *rigidbody.RigidBody {
+	return &rigidbody.RigidBody{
+		Position:  vector.Vector{X: cx, Y: cy},
+		Velocity:  vector.Vector{X: 0, Y: 0},
+		Mass:      0,
+		Shape:     "rectangle",
+		Width:     width,
+		Height:    height,
+		IsMovable: false,
+	}
+}
+
+// MakeCircleRigidBody creates a circle rigidbody with center (cx,cy) and radius r
+func MakeCircleRigidBody(cx, cy, r float64) *rigidbody.RigidBody {
+	return &rigidbody.RigidBody{
+		Position:  vector.Vector{X: cx, Y: cy},
+		Velocity:  vector.Vector{X: 0, Y: 0},
+		Mass:      0,
+		Shape:     "circle",
+		Radius:    r,
+		IsMovable: false,
+	}
+}
+
+// MakePolygonRigidBodyFromPoints creates a polygon rigidbody from absolute world-space points
+// It returns the rigidbody and the raw vertex list (useful for registering with physics engine)
+func MakePolygonRigidBodyFromPoints(points []vector.Vector) (*rigidbody.RigidBody, []vector.Vector) {
+	if len(points) == 0 {
+		return nil, nil
+	}
+
+	// compute bounding box
+	minX, minY := points[0].X, points[0].Y
+	maxX, maxY := points[0].X, points[0].Y
+	for _, p := range points {
+		if p.X < minX {
+			minX = p.X
+		}
+		if p.X > maxX {
+			maxX = p.X
+		}
+		if p.Y < minY {
+			minY = p.Y
+		}
+		if p.Y > maxY {
+			maxY = p.Y
+		}
+	}
+
+	width := maxX - minX
+	height := maxY - minY
+	centerX := minX + width/2.0
+	centerY := minY + height/2.0
+
+	poly := polygon.NewPolygon(points, 0, false)
+	poly.RigidBody.Position = vector.Vector{X: centerX, Y: centerY}
+	poly.RigidBody.Width = width
+	poly.RigidBody.Height = height
+	poly.RigidBody.IsMovable = false
+	poly.RigidBody.Shape = "polygon"
+
+	return &poly.RigidBody, points
+}
+
+// MakeRigidBodyFromTileTemplate creates a rigidbody (and optional vertex list) from a TileColliderTemplate
+// tileX/tileY are the top-left world coordinates of the tile
+func MakeRigidBodyFromTileTemplate(tileX, tileY float64, ct TileColliderTemplate) (*rigidbody.RigidBody, []vector.Vector) {
+	switch ct.Type {
+	case "rectangle":
+		cx := tileX + ct.OffsetX + ct.Width/2.0
+		cy := tileY + ct.OffsetX + ct.Height/2.0
+		return MakeRectangleRigidBody(cx, cy, ct.Width, ct.Height), nil
+	case "circle":
+		cx := tileX + ct.OffsetX
+		cy := tileY - ct.Radius*2.0
+		return MakeCircleRigidBody(cx, cy, ct.Radius), nil
+	case "polygon":
+		points := make([]vector.Vector, len(ct.Polygon))
+		for i, p := range ct.Polygon {
+			points[i] = vector.Vector{X: tileX + ct.OffsetX + p.X, Y: tileY + ct.OffsetX + p.Y}
+		}
+		rb, pts := MakePolygonRigidBodyFromPoints(points)
+		return rb, pts
+	default:
+		return nil, nil
 	}
 }

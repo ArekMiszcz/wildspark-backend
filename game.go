@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/rudransh61/Physix-go/pkg/rigidbody"
@@ -13,24 +14,30 @@ import (
 
 // OpCode constants for different message types
 const (
-	OpCodeWorldState  = 1 // Initial world state for new players
-	OpCodeWorldUpdate = 2 // Regular world state updates
-	OpCodeMapChange   = 3 // Map change notifications
-	OpCodeInputACK    = 4 // Input acknowledgments
+	OpCodeWorldState   = 1 // Initial world state for new players
+	OpCodeWorldUpdate  = 2 // Regular world state updates
+	OpCodeMapChange    = 3 // Map change notifications
+	OpCodeInputACK     = 4 // Input acknowledgments
+	OpCodeObjectUpdate = 5 // Interaction notifications (e.g., item pickups)
 )
 
 type GameMatch struct{}
 
 type GameMatchState struct {
-	presences       map[string]runtime.Presence
-	gameObjects     []*rigidbody.RigidBody
-	playerObjects   map[string]*rigidbody.RigidBody // Map playerID -> RigidBody
-	currentTick     int64
-	inputProcessor  *InputProcessor
-	physicsEngine   *PhysicsEngine
-	databaseManager *DatabaseManager
-	mapLoader       *MapLoader
-	currentMap      *LoadedMap
+	presences          map[string]runtime.Presence
+	objects            map[int]*ObjectData
+	gameObjects        []*rigidbody.RigidBody
+	playerObjects      map[string]*rigidbody.RigidBody
+	currentTick        int64
+	inputProcessor     *InputProcessor
+	physicsEngine      *PhysicsEngine
+	databaseManager    *DatabaseManager
+	mapLoader          *MapLoader
+	currentMap         *LoadedMap
+	scriptEngine       *ScriptEngine
+	mu                 sync.Mutex
+	gameObjectsByOwner map[int][]*rigidbody.RigidBody // map from object ID -> colliders owned by that object (authoritative owner index)
+	rbOwner            map[*rigidbody.RigidBody]int   // reverse lookup from rigid body pointer -> owner object id (helps cleanup)
 }
 
 type GameMessage struct {
@@ -40,6 +47,7 @@ type GameMessage struct {
 
 type PlayerInput struct {
 	PlayerID      string  `json:"playerId"`
+	ObjectID      int     `json:"objectId,omitempty"`
 	Action        string  `json:"action"`
 	InputSequence uint64  `json:"inputSequence"`       // Added
 	X             float64 `json:"x,omitempty"`         // For direct position (spawn/teleport)
@@ -65,6 +73,14 @@ type GameState struct {
 	Tick        int64                  `json:"tick"`
 	GameObjects []*rigidbody.RigidBody `json:"gameObjects"`
 	Players     map[string]PlayerData  `json:"players"`
+}
+
+type ObjectData struct {
+	ID    int
+	Name  string
+	Type  string
+	GID   uint32
+	Props map[string]interface{}
 }
 
 type PlayerData struct {
@@ -106,14 +122,20 @@ func (m *GameMatch) MatchInit(ctx context.Context, logger runtime.Logger, db *sq
 
 	state := &GameMatchState{
 		presences:       make(map[string]runtime.Presence),
-		gameObjects:     make([]*rigidbody.RigidBody, 0),       // Start empty, will be populated by map
-		playerObjects:   make(map[string]*rigidbody.RigidBody), // Player-to-object mapping
+		objects:         make(map[int]*ObjectData),
+		gameObjects:     make([]*rigidbody.RigidBody, 0),
+		playerObjects:   make(map[string]*rigidbody.RigidBody),
 		currentTick:     0,
 		inputProcessor:  NewInputProcessor(),
 		physicsEngine:   physicsEngine,
 		databaseManager: NewDatabaseManager(logger, nk),
-		mapLoader:       mapLoader, // Maps directory
+		mapLoader:       mapLoader,
 		currentMap:      nil,
+		scriptEngine:    NewScriptEngine(logger, "/nakama/data/scripts"),
+		// map from object ID -> colliders owned by that object (authoritative owner index)
+		gameObjectsByOwner: make(map[int][]*rigidbody.RigidBody),
+		// reverse lookup from rigid body pointer -> owner object id (helps cleanup)
+		rbOwner: make(map[*rigidbody.RigidBody]int),
 	}
 
 	// Try to load default map
@@ -304,7 +326,7 @@ func (m *GameMatch) MatchLoop(ctx context.Context, logger runtime.Logger, db *sq
 		// 	input.PlayerID, message.GetOpCode(), input.Action, input.InputSequence, input.VelocityX, input.VelocityY)
 
 		// Process the input (e.g., update velocity)
-		gameState.inputProcessor.ProcessPlayerInput(gameState, &input, logger)
+		gameState.inputProcessor.ProcessPlayerInput(gameState, &input, dispatcher, logger)
 
 		// After processing input, especially movement, prepare an ACK
 		// The actual position update will happen in the physics step.
@@ -458,4 +480,149 @@ func EnsureDefaultMatch(ctx context.Context, nk runtime.NakamaModule, logger run
 
 	logger.Info("Found %d existing open world matches", len(matches))
 	return nil
+}
+
+// AddOwnerCollider adds a collider to the physics slice and records ownership.
+// If polygonPoints is non-nil and non-empty, the polygon will be registered with the physics engine.
+func (gs *GameMatchState) AddOwnerCollider(owner int, rb *rigidbody.RigidBody, polygonPoints []vector.Vector) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	gs.gameObjects = append(gs.gameObjects, rb)
+	gs.gameObjectsByOwner[owner] = append(gs.gameObjectsByOwner[owner], rb)
+	gs.rbOwner[rb] = owner
+
+	if gs.physicsEngine != nil && len(polygonPoints) > 0 {
+		AddPolygonToPhysicsEngine(gs.physicsEngine, rb, polygonPoints)
+	}
+}
+
+// RemoveOwnerColliders removes all colliders owned by the given object and cleans up physics registry.
+func (gs *GameMatchState) RemoveOwnerColliders(owner int) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	toRemove := make(map[*rigidbody.RigidBody]bool)
+	for _, rb := range gs.gameObjectsByOwner[owner] {
+		toRemove[rb] = true
+		if gs.physicsEngine != nil {
+			delete(gs.physicsEngine.polygonRegistry, rb)
+		}
+		delete(gs.rbOwner, rb)
+	}
+
+	// filter gameObjects
+	newList := make([]*rigidbody.RigidBody, 0, len(gs.gameObjects))
+	for _, gobj := range gs.gameObjects {
+		if !toRemove[gobj] {
+			newList = append(newList, gobj)
+		}
+	}
+	gs.gameObjects = newList
+	delete(gs.gameObjectsByOwner, owner)
+}
+
+// AddStaticCollider adds a collider to gameObjects without assigning an owner.
+// polygonPoints may be provided to register polygon shapes with the physics engine.
+func (gs *GameMatchState) AddStaticCollider(rb *rigidbody.RigidBody, polygonPoints []vector.Vector) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	gs.gameObjects = append(gs.gameObjects, rb)
+	if gs.physicsEngine != nil && len(polygonPoints) > 0 {
+		AddPolygonToPhysicsEngine(gs.physicsEngine, rb, polygonPoints)
+	}
+}
+
+// AddPlayerObject registers a player-owned rigid body and keeps playerObjects mapping consistent.
+func (gs *GameMatchState) AddPlayerObject(playerID string, rb *rigidbody.RigidBody) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	gs.gameObjects = append(gs.gameObjects, rb)
+	if gs.playerObjects == nil {
+		gs.playerObjects = make(map[string]*rigidbody.RigidBody)
+	}
+	gs.playerObjects[playerID] = rb
+}
+
+// RemovePlayerObject removes a player's rigidbody from gameObjects and cleans up any related registries.
+func (gs *GameMatchState) RemovePlayerObject(playerID string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	rb, ok := gs.playerObjects[playerID]
+	if !ok || rb == nil {
+		return
+	}
+
+	// remove from gameObjects slice
+	for i, obj := range gs.gameObjects {
+		if obj == rb {
+			gs.gameObjects = append(gs.gameObjects[:i], gs.gameObjects[i+1:]...)
+			break
+		}
+	}
+
+	// remove from player mapping
+	delete(gs.playerObjects, playerID)
+
+	// remove polygon registry entry if present
+	if gs.physicsEngine != nil {
+		delete(gs.physicsEngine.polygonRegistry, rb)
+	}
+
+	// If this rigidbody was tracked in rbOwner, clean up owner indexes
+	if owner, found := gs.rbOwner[rb]; found {
+		// remove rb from owner's list
+		list := gs.gameObjectsByOwner[owner]
+		newList := make([]*rigidbody.RigidBody, 0, len(list))
+		for _, r := range list {
+			if r != rb {
+				newList = append(newList, r)
+			}
+		}
+		if len(newList) == 0 {
+			delete(gs.gameObjectsByOwner, owner)
+		} else {
+			gs.gameObjectsByOwner[owner] = newList
+		}
+		delete(gs.rbOwner, rb)
+	}
+}
+
+// BroadcastObjectUpdate builds a small object delta and broadcasts it to connected clients.
+// If dispatcher is nil the function returns after preparing the payload (no-op for broadcast).
+func (gs *GameMatchState) BroadcastObjectUpdate(oid int, dispatcher runtime.MatchDispatcher, logger runtime.Logger) {
+	// Read object state under lock
+	gs.mu.Lock()
+	obj, ok := gs.objects[oid]
+	gs.mu.Unlock()
+	if !ok || obj == nil {
+		return
+	}
+
+	// Build payload with minimal fields clients need to render
+	payload := map[string]interface{}{
+		"id":    obj.ID,
+		"gid":   obj.GID,
+		"props": obj.Props,
+	}
+
+	msg := GameMessage{
+		Type: "object.update",
+		Data: payload,
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		logger.Error("BroadcastObjectUpdate: failed to marshal object update: %v", err)
+		return
+	}
+
+	if dispatcher != nil {
+		dispatcher.BroadcastMessage(OpCodeObjectUpdate, data, nil, nil, true)
+	} else {
+		// No dispatcher available; caller can choose to enqueue or log. For now we do nothing.
+	}
 }

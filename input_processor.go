@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/rudransh61/Physix-go/pkg/rigidbody"
 	"github.com/rudransh61/Physix-go/pkg/vector"
@@ -14,12 +16,14 @@ func NewInputProcessor() *InputProcessor {
 }
 
 // ProcessPlayerInput handles different types of player actions
-func (ip *InputProcessor) ProcessPlayerInput(gameState *GameMatchState, input *PlayerInput, logger runtime.Logger) {
+func (ip *InputProcessor) ProcessPlayerInput(gameState *GameMatchState, input *PlayerInput, dispatcher runtime.MatchDispatcher, logger runtime.Logger) {
 	switch input.Action {
 	case "spawn":
 		ip.handleSpawn(gameState, input, logger)
 	case "move":
 		ip.handleMovement(gameState, input, logger)
+	case "interact":
+		ip.handleInteract(gameState, input, dispatcher, logger)
 	default:
 		// logger.Debug("Unknown action: %s from player: %s", input.Action, input.PlayerID)
 	}
@@ -109,30 +113,97 @@ func (ip *InputProcessor) CreatePlayerObject(gameState *GameMatchState, playerID
 		IsMovable: true,
 	}
 
-	// Add to game objects
-	gameState.gameObjects = append(gameState.gameObjects, playerObject)
-
-	// Add to player objects mapping
-	gameState.playerObjects[playerID] = playerObject
+	// Register player object using game state helper to ensure thread-safety and consistent indices
+	gameState.AddPlayerObject(playerID, playerObject)
 
 	return playerObject
 }
 
 // RemovePlayerObject removes a player's game object when they leave
 func (ip *InputProcessor) RemovePlayerObject(gameState *GameMatchState, playerID string) {
-	// Find and remove player's object
-	playerObject := ip.FindPlayerObject(gameState, playerID)
-	if playerObject != nil {
-		// Remove from game objects slice
-		for i, obj := range gameState.gameObjects {
-			if obj == playerObject {
-				// Remove from slice
-				gameState.gameObjects = append(gameState.gameObjects[:i], gameState.gameObjects[i+1:]...)
-				break
-			}
-		}
+	// Use game state helper to remove player object and cleanup
+	gameState.RemovePlayerObject(playerID)
+}
 
-		// Remove from player objects mapping
-		delete(gameState.playerObjects, playerID)
+func (ip *InputProcessor) handleInteract(gameState *GameMatchState, input *PlayerInput, dispatcher runtime.MatchDispatcher, logger runtime.Logger) {
+	if gameState.currentMap == nil && input.ObjectID != 0 {
+		return
+	}
+	obj := gameState.objects[input.ObjectID]
+	if obj == nil {
+		logger.Warn("interact: unknown object id %d", input.ObjectID)
+		return
+	}
+	// log object properties
+	logger.Info("interact: object %d properties: %+v", input.ObjectID, obj.Props)
+	scriptPathAny := obj.Props["script"]
+	scriptPath, _ := scriptPathAny.(string)
+	if scriptPath == "" {
+		logger.Warn("interact: object %d has no 'script' property", input.ObjectID)
+		return
+	}
+	// Execute script
+	params := map[string]any{
+		"playerId": input.PlayerID,
+		"objectId": input.ObjectID,
+		"event":    input.Action,
+		"gid":      obj.GID,
+	}
+
+	// Build a serializable object state map to pass to scripts (includes runtime properties)
+	objectState := map[string]any{
+		"id":    obj.ID,
+		"name":  obj.Name,
+		"type":  obj.Type,
+		"gid":   obj.GID,
+		"props": obj.Props, // contains scripted properties and runtime flags like "open"
+	}
+	params["object"] = objectState
+
+	effects, err := gameState.scriptEngine.Execute(scriptPath, params, gameState, dispatcher)
+	if err != nil {
+		logger.Error("interact script error for object %d: %v", input.ObjectID, err)
+		return
+	}
+	if len(effects) == 0 {
+		return
+	}
+
+	// go through effects and log them
+	for _, effect := range effects {
+		if effect.AckMessage != "" {
+			logger.Info("interact: object %d effect: ACK message: %s", input.ObjectID, effect.AckMessage)
+			ip.sendInputACK(input, dispatcher, InputACK{
+				InputSequence: input.InputSequence,
+				X:             gameState.playerObjects[input.PlayerID].Position.X,
+				Y:             gameState.playerObjects[input.PlayerID].Position.Y,
+				Action:        effect.AckMessage,
+			}, gameState, logger)
+		}
+	}
+}
+
+func (ip *InputProcessor) sendInputACK(input *PlayerInput, dispatcher runtime.MatchDispatcher, data InputACK, gameState *GameMatchState, logger runtime.Logger) {
+	playerObject := ip.FindPlayerObject(gameState, input.PlayerID)
+
+	if playerObject == nil {
+		logger.Error("sendInputACK: Player object not found for %s", input.PlayerID)
+		return
+	}
+
+	ackMessage := GameMessage{
+		Type: "input_ack",
+		Data: data,
+	}
+
+	ackData, err := json.Marshal(ackMessage)
+	if err != nil {
+		logger.Error("Failed to encode ACK message for player %s: %v", input.PlayerID, err)
+		return
+	}
+
+	// Send the ACK to the specific player who sent the input
+	if presence, ok := gameState.presences[input.PlayerID]; ok {
+		dispatcher.BroadcastMessage(OpCodeInputACK, ackData, []runtime.Presence{presence}, nil, true)
 	}
 }
