@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/json"
-
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/rudransh61/Physix-go/pkg/rigidbody"
 	"github.com/rudransh61/Physix-go/pkg/vector"
@@ -156,7 +154,7 @@ func (ip *InputProcessor) handleInteract(gameState *GameMatchState, input *Playe
 		"name":  obj.Name,
 		"type":  obj.Type,
 		"gid":   obj.GID,
-		"props": obj.Props, // contains scripted properties and runtime flags like "open"
+		"props": obj.Props,
 	}
 	params["object"] = objectState
 
@@ -173,37 +171,6 @@ func (ip *InputProcessor) handleInteract(gameState *GameMatchState, input *Playe
 	for _, effect := range effects {
 		if effect.AckMessage != "" {
 			logger.Info("interact: object %d effect: ACK message: %s", input.ObjectID, effect.AckMessage)
-			ip.sendInputACK(input, dispatcher, InputACK{
-				InputSequence: input.InputSequence,
-				X:             gameState.playerObjects[input.PlayerID].Position.X,
-				Y:             gameState.playerObjects[input.PlayerID].Position.Y,
-				Action:        effect.AckMessage,
-			}, gameState, logger)
 		}
-	}
-}
-
-func (ip *InputProcessor) sendInputACK(input *PlayerInput, dispatcher runtime.MatchDispatcher, data InputACK, gameState *GameMatchState, logger runtime.Logger) {
-	playerObject := ip.FindPlayerObject(gameState, input.PlayerID)
-
-	if playerObject == nil {
-		logger.Error("sendInputACK: Player object not found for %s", input.PlayerID)
-		return
-	}
-
-	ackMessage := GameMessage{
-		Type: "input_ack",
-		Data: data,
-	}
-
-	ackData, err := json.Marshal(ackMessage)
-	if err != nil {
-		logger.Error("Failed to encode ACK message for player %s: %v", input.PlayerID, err)
-		return
-	}
-
-	// Send the ACK to the specific player who sent the input
-	if presence, ok := gameState.presences[input.PlayerID]; ok {
-		dispatcher.BroadcastMessage(OpCodeInputACK, ackData, []runtime.Presence{presence}, nil, true)
 	}
 }

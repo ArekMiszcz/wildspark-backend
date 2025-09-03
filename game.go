@@ -21,6 +21,17 @@ const (
 	OpCodeObjectUpdate = 5 // Interaction notifications (e.g., item pickups)
 )
 
+// Coordinate / tile sizing constants
+// Note on coordinate convention:
+// - Map editor (e.g., Tiled) often stores object positions using a top-left origin for tiles/sprites.
+// - The game server / physics may use a different anchor (for example a center or bottom-left origin).
+// The offsets below (HalfTile) convert between the map's stored position and the position expected by
+// the clients/physics. If your map/editor or sprite sizes change, update TileSize accordingly.
+const (
+	TileSize = 32.0
+	HalfTile = TileSize / 2.0
+)
+
 type GameMatch struct{}
 
 type GameMatchState struct {
@@ -60,6 +71,7 @@ type PlayerInput struct {
 // ACK response structure
 type InputACK struct {
 	PlayerID      string  `json:"playerId"`
+	ObjectID      int     `json:"objectId,omitempty"`
 	Action        string  `json:"action"`
 	InputSequence uint64  `json:"inputSequence"` // Added
 	Approved      bool    `json:"approved"`
@@ -67,6 +79,7 @@ type InputACK struct {
 	Timestamp     int64   `json:"timestamp"`
 	X             float64 `json:"x,omitempty"` // Server authoritative position
 	Y             float64 `json:"y,omitempty"` // Server authoritative position
+	Gid           uint32  `json:"gid,omitempty"`
 }
 
 type GameState struct {
@@ -598,19 +611,24 @@ func (gs *GameMatchState) BroadcastObjectUpdate(oid int, dispatcher runtime.Matc
 	gs.mu.Lock()
 	obj, ok := gs.objects[oid]
 	gs.mu.Unlock()
+
+	logger.Info("BroadcastObjectUpdate: broadcasting update for object ID %d", oid)
+
 	if !ok || obj == nil {
+		logger.Warn("BroadcastObjectUpdate: object ID %d not found", oid)
 		return
 	}
 
 	// Build payload with minimal fields clients need to render
-	payload := map[string]interface{}{
-		"id":    obj.ID,
-		"gid":   obj.GID,
-		"props": obj.Props,
+	payload := map[string]any{
+		"objectId": obj.ID,
+		"gid":      obj.GID,
+		"props":    obj.Props,
+		"pos":      map[string]any{"x": obj.Props["x"].(float64) - HalfTile, "y": obj.Props["y"].(float64) + HalfTile},
 	}
 
 	msg := GameMessage{
-		Type: "object.update",
+		Type: "object_update",
 		Data: payload,
 	}
 
@@ -621,6 +639,7 @@ func (gs *GameMatchState) BroadcastObjectUpdate(oid int, dispatcher runtime.Matc
 	}
 
 	if dispatcher != nil {
+		logger.Info("BroadcastObjectUpdate: dispatching update for object ID %d", oid)
 		dispatcher.BroadcastMessage(OpCodeObjectUpdate, data, nil, nil, true)
 	} else {
 		// No dispatcher available; caller can choose to enqueue or log. For now we do nothing.

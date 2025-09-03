@@ -146,10 +146,81 @@ func (se *ScriptEngine) Execute(scriptPath string, params map[string]any, gs *Ga
 		return 0
 	})
 
+	register("get_object_prop", func(L *lua.LState) int {
+		oid := int(L.CheckNumber(1))
+		key := L.CheckString(2)
+
+		if gs != nil {
+			if obj := gs.objects[oid]; obj != nil {
+				if v, ok := obj.Props[key]; ok {
+					switch vv := v.(type) {
+					case string:
+						L.Push(lua.LString(vv))
+					case float64:
+						L.Push(lua.LNumber(vv))
+					case bool:
+						L.Push(lua.LBool(vv))
+					case map[string]interface{}:
+						tbl := L.NewTable()
+						for k, val := range vv {
+							switch vvv := val.(type) {
+							case string:
+								tbl.RawSetString(k, lua.LString(vvv))
+							case float64:
+								tbl.RawSetString(k, lua.LNumber(vvv))
+							case bool:
+								tbl.RawSetString(k, lua.LBool(vvv))
+							default:
+								tbl.RawSetString(k, lua.LString(fmt.Sprintf("%v", vvv)))
+							}
+						}
+						L.Push(tbl)
+					case []interface{}:
+						tbl := L.NewTable()
+						for i, val := range vv {
+							switch vvv := val.(type) {
+							case string:
+								tbl.RawSetInt(i+1, lua.LString(vvv))
+							case float64:
+								tbl.RawSetInt(i+1, lua.LNumber(vvv))
+							case bool:
+								tbl.RawSetInt(i+1, lua.LBool(vvv))
+							default:
+								tbl.RawSetInt(i+1, lua.LString(fmt.Sprintf("%v", vvv)))
+							}
+						}
+						L.Push(tbl)
+					default:
+						L.Push(lua.LString(fmt.Sprintf("%v", vv)))
+					}
+					return 1
+				}
+			}
+		}
+		L.Push(lua.LNil)
+		return 1
+	})
+
+	register("has_object_prop", func(L *lua.LState) int {
+		oid := int(L.CheckNumber(1))
+		key := L.CheckString(2)
+
+		if gs != nil {
+			if obj := gs.objects[oid]; obj != nil {
+				_, ok := obj.Props[key]
+				L.Push(lua.LBool(ok))
+				return 1
+			}
+		}
+		L.Push(lua.LBool(false))
+		return 1
+	})
+
 	// Script API: set_object_gid(objectId, gid)
 	register("set_object_gid", func(L *lua.LState) int {
 		oid := int(L.CheckNumber(1))
 		gid := uint32(L.CheckNumber(2))
+
 		if gs == nil {
 			return 0
 		}
